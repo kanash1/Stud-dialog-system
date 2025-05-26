@@ -3,6 +3,8 @@ from fastapi import (
     APIRouter, HTTPException, Request, Depends,
     File, UploadFile, FastAPI, Query
 )
+from fastapi.responses import StreamingResponse
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession, create_async_engine, async_sessionmaker
@@ -12,6 +14,7 @@ from datetime import timedelta, datetime, timezone
 from typing import AsyncGenerator, List, Optional
 from types import SimpleNamespace
 from contextlib import asynccontextmanager
+import json
 
 from .rag_chain import (
     RAGSystem, ReadFileError,
@@ -23,6 +26,10 @@ from .shemas import (
     LoginRequest, SessionResponse, TokenResponse, LLMResponse
 )
 from . import session_service, message_service, user_service, config
+
+from langchain.globals import set_verbose
+
+set_verbose(True)
 
 # --- Логирование ---
 logger = logging.getLogger(__name__)
@@ -238,18 +245,35 @@ async def upload_docs(
             status_code=415, detail=str(e)
         )
 
+
 # --- Получение списка сессий пользователя ---    
-@router.get("/sessions", response_model=List[SessionResponse])
+@router.get("/sessions", response_model=PaginatedResponse[SessionResponse])
 async def get_user_sessions(
+    limit: int = Query(20, ge=1, le=100),
+    after_id: Optional[int] = Query(None),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session)
 ):
-    sessions = await session_service.get_sessions_by_user_id(session, user.user_id)
-    return sessions
+    sessions = await session_service.get_sessions_by_user_id_cursor(
+        session, 
+        user.user_id,
+        limit,
+        after_id
+    )
+
+    next_cursor = sessions[-1].session_id if sessions else None
+
+    return PaginatedResponse[SessionResponse](
+        items=[SessionResponse.from_orm(s) for s in sessions],
+        next_cursor=next_cursor
+    )
 
 
 # --- Получение списка сообщений из сесиии пользователя ---   
-@router.get("/messages/{session_id}", response_model=PaginatedResponse[MessageResponse])
+@router.get(
+    "/sessions/{session_id}/messages",
+    response_model=PaginatedResponse[MessageResponse]
+)
 async def get_session_messages(
     session_id: int,
     limit: int = Query(20, ge=1, le=100),
@@ -276,3 +300,66 @@ async def get_session_messages(
         items=[MessageResponse.from_orm(m) for m in messages],
         next_cursor=next_cursor
     )
+
+# --- Запрос к модели с потоковой генерацией ответа ---
+@router.post("/query-stream")
+async def query_stream(
+    request: QueryRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_async_session),
+    rag: RAGSystem = Depends(get_rag_system),
+):
+    try:
+        # сохранение вопроса пользователя
+        if request.session_id:
+            user_session = await session_service.get_session_by_sid_and_uid(
+                db, request.session_id, user.user_id
+            )
+            if not user_session:
+                raise HTTPException(404, "Session not found")
+        else:
+            user_session = await session_service.create_session(db, user.user_id)
+
+        user_msg = await message_service.create_message(
+            db, user_session.session_id,
+            {"type": "human", "content": request.query}
+        )
+        await db.flush()
+        await db.commit()
+
+         # потоковое общение
+        async def event_stream():
+            meta = {
+                "session_id": user_session.session_id,
+                "user_message_id": user_msg.message_id
+            }
+            yield f"event: meta\ndata: {json.dumps(meta, ensure_ascii=False)}\n\n"
+
+            accumulated: list[str] = []
+
+            async for chunk in rag.stream_invoke(
+                {"input": request.query, "chat_history": []},
+                use_rag=request.use_rag,
+                adapter=request.adapter,
+            ):
+                payload = jsonable_encoder(chunk) 
+                yield f"event: chunk\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                accumulated.append(chunk.content)
+
+            full_answer = "".join(accumulated)
+            agent_msg = await message_service.create_message(
+                db, user_session.session_id,
+                {"type": "ai", "content": full_answer}
+            )
+            await db.commit()
+
+            end_evt = {"agent_message_id": agent_msg.message_id}
+            payload = json.dumps(end_evt, ensure_ascii=False)
+            yield f"event: end\ndata: {payload}\n\n"
+
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    except Exception:
+        await db.rollback()
+        raise 

@@ -1,7 +1,7 @@
 import os
 import logging
 from io import BytesIO
-from typing import Any, List, Tuple
+from typing import Any, List, Tuple, AsyncGenerator
 
 from docx import Document as DocxDocument
 from pypdf import PdfReader
@@ -18,6 +18,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_postgres.v2.vectorstores import AsyncPGVectorStore
 from langchain_postgres.v2.engine import PGEngine
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.messages.ai import AIMessageChunk
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -187,7 +188,7 @@ class RAGSystem:
             llm=llm,
             retriever=self._doc_store.vector_store.as_retriever(
                 search_type="similarity_score_threshold",
-                search_kwargs={"score_threshold": 0.6, "k": 5}
+                search_kwargs={"score_threshold": 0.65, "k": 15}
             ),
             prompt=prompt
         )
@@ -245,3 +246,20 @@ class RAGSystem:
         logger.info("Invoking non-RAG chain...")
         result = await self._create_non_rag_chain(llm).ainvoke(input)
         return result.text()
+    
+    async def stream_invoke(
+        self,
+        input: dict[str, Any],
+        use_rag: bool = False,
+        adapter: str = None
+    ) -> AsyncGenerator[AIMessageChunk, None]:
+        llm = self._create_llm(adapter)
+
+        chain = (
+            self._create_rag_chain(llm)
+            if use_rag else
+            self._create_non_rag_chain(llm)
+        )
+
+        async for chunk in chain.astream(input):
+            yield chunk

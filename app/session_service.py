@@ -46,19 +46,27 @@ async def create_session(
     logger.info(f"Session created with session_id={user_session.session_id}")
     return user_session
 
-# Получение всех сессий пользователя, отсортированных по времени
-async def get_sessions_by_user_id(
+# Получение всех сессий пользователя с постраничной навигацией (cursor-based)
+async def get_sessions_by_user_id_cursor(
     session: AsyncSession,
-    user_id: int
+    user_id: int,
+    limit: int = 20,
+    after_id: int | None = None
 ) -> list[Session]:
-    logger.info(f"Fetching all sessions for user_id={user_id}")
-    
-    result = await session.execute(
-        select(Session)
-        .where(Session.user_id == user_id)
-        .order_by(asc(Session.created_at))
+    logger.info(
+        f"Fetching sessions for user_id={user_id} after_id={after_id} limit={limit}" 
     )
-    
+
+    query = select(Session).where(Session.user_id == user_id)
+
+    if after_id is not None:
+        # Добавление условия для cursor-based пагинации
+        query = query.where(Session.session_id > after_id)
+
+    query = query.order_by(asc(Session.session_id)).limit(limit)
+
+    result = await session.execute(query)
     sessions = result.scalars().all()
+
     logger.info(f"Fetched {len(sessions)} sessions.")
     return sessions
