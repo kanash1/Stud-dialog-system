@@ -256,7 +256,7 @@ class RAGSystem:
         llm = self._create_llm(adapter)
 
         chain = (
-            self._create_rag_chain(llm)
+            self._create_rag_chain(llm) 
             if use_rag else
             self._create_non_rag_chain(llm)
         )
